@@ -552,6 +552,16 @@ public:
                   ConversionPatternRewriter &rewriter) const override;
 };
 
+/// Converts std.sitofp to spv.ConvertSToF.
+class SIToFPOpPattern final : public SPIRVOpLowering<SIToFPOp> {
+public:
+  using SPIRVOpLowering<SIToFPOp>::SPIRVOpLowering;
+
+  LogicalResult
+  matchAndRewrite(SIToFPOp sitofpOp, ArrayRef<Value> operands,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -1058,6 +1068,39 @@ XOrOpPattern::matchAndRewrite(XOrOp xorOp, ArrayRef<Value> operands,
 }
 
 //===----------------------------------------------------------------------===//
+// SIToFPOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+SIToFPOpPattern::matchAndRewrite(SIToFPOp sitofpOp, ArrayRef<Value> operands,
+                                 ConversionPatternRewriter &rewriter) const {
+    assert(operands.size() == 1);
+    auto srcType = operands.front().getType();
+    if (srcType.isSignlessInteger() && srcType.getIntOrFloatBitWidth() == 1)
+      return failure();
+    auto dstType =
+        this->typeConverter.convertType(sitofpOp.getResult().getType());
+    if (dstType == srcType) {
+      // Due to type conversion, we are seeing the same source and target type.
+      // Then we can just erase this operation by forwarding its operand.
+      rewriter.replaceOp(sitofpOp, operands.front());
+    } else {
+      auto dstWidth = dstType.getIntOrFloatBitWidth();
+      if(srcType.getIntOrFloatBitWidth() != dstWidth) {
+        auto dstSType = rewriter.getIntegerType(dstWidth);
+        auto loc = sitofpOp.getLoc();
+        auto sconvertOp = rewriter.create<spirv::SConvertOp>(loc, dstSType, operands, ArrayRef<NamedAttribute>());
+        rewriter.replaceOpWithNewOp<spirv::ConvertSToFOp>(
+            sitofpOp, dstType, sconvertOp.getResult());
+      } else {
+        rewriter.replaceOpWithNewOp<spirv::ConvertSToFOp>(
+            sitofpOp, dstType, operands, ArrayRef<NamedAttribute>());
+      }
+    }
+    return success();
+}
+
+//===----------------------------------------------------------------------===//
 // Pattern population
 //===----------------------------------------------------------------------===//
 
@@ -1111,7 +1154,8 @@ void populateStandardToSPIRVPatterns(MLIRContext *context,
 
       // Type cast patterns
       ZeroExtendI1Pattern, TypeCastingOpPattern<IndexCastOp, spirv::SConvertOp>,
-      TypeCastingOpPattern<SIToFPOp, spirv::ConvertSToFOp>,
+      SIToFPOpPattern,
+      //TypeCastingOpPattern<SIToFPOp, spirv::ConvertSToFOp>,
       TypeCastingOpPattern<ZeroExtendIOp, spirv::UConvertOp>,
       TypeCastingOpPattern<TruncateIOp, spirv::SConvertOp>,
       TypeCastingOpPattern<FPToSIOp, spirv::ConvertFToSOp>,
