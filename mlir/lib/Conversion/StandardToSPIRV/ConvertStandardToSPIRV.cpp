@@ -182,7 +182,13 @@ static Value adjustAccessChainForBitwidth(SPIRVTypeConverter &typeConverter,
 static Value shiftValue(Location loc, Value value, Value offset, Value mask,
                         int targetBits, OpBuilder &builder) {
   Type targetType = builder.getIntegerType(targetBits);
-  Value result = builder.create<spirv::BitwiseAndOp>(loc, value, mask);
+  Value result;
+  if(mask.getType() != value.getType()) {
+    auto sconvertOp = builder.create<spirv::SConvertOp>(loc, mask.getType(), value);
+    result = builder.create<spirv::BitwiseAndOp>(loc, sconvertOp.getResult(), mask);
+  } else {
+    result = builder.create<spirv::BitwiseAndOp>(loc, value, mask);
+  }
   return builder.create<spirv::ShiftLeftLogicalOp>(loc, targetType, result,
                                                    offset);
 }
