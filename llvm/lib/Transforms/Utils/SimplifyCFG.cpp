@@ -106,6 +106,10 @@ static cl::opt<bool> DupRet(
     cl::desc("Duplicate return instructions into unconditional branches"));
 
 static cl::opt<bool>
+    HoistCommon("simplifycfg-hoist-common", cl::Hidden, cl::init(true),
+                cl::desc("Hoist common instructions up to the parent block"));
+
+static cl::opt<bool>
     SinkCommon("simplifycfg-sink-common", cl::Hidden, cl::init(true),
                cl::desc("Sink common instructions down to the end block"));
 
@@ -158,6 +162,8 @@ STATISTIC(NumSinkCommonCode,
 STATISTIC(NumSinkCommonInstrs,
           "Number of common instructions sunk down to the end block");
 STATISTIC(NumSpeculations, "Number of speculative executed instructions");
+STATISTIC(NumInvokes,
+          "Number of invokes with empty resume blocks simplified into calls");
 
 namespace {
 
@@ -1989,6 +1995,65 @@ static Value *isSafeToSpeculateStore(Instruction *I, BasicBlock *BrBB,
   return nullptr;
 }
 
+/// Estimate the cost of the insertion(s) and check that the PHI nodes can be
+/// converted to selects.
+static bool validateAndCostRequiredSelects(BasicBlock *BB, BasicBlock *ThenBB,
+                                           BasicBlock *EndBB,
+                                           unsigned &SpeculatedInstructions,
+                                           int &BudgetRemaining,
+                                           const TargetTransformInfo &TTI) {
+  TargetTransformInfo::TargetCostKind CostKind =
+    BB->getParent()->hasMinSize()
+    ? TargetTransformInfo::TCK_CodeSize
+    : TargetTransformInfo::TCK_SizeAndLatency;
+
+  bool HaveRewritablePHIs = false;
+  for (PHINode &PN : EndBB->phis()) {
+    Value *OrigV = PN.getIncomingValueForBlock(BB);
+    Value *ThenV = PN.getIncomingValueForBlock(ThenBB);
+
+    // FIXME: Try to remove some of the duplication with HoistThenElseCodeToIf.
+    // Skip PHIs which are trivial.
+    if (ThenV == OrigV)
+      continue;
+
+    BudgetRemaining -=
+        TTI.getCmpSelInstrCost(Instruction::Select, PN.getType(), nullptr,
+                               CostKind);
+
+    // Don't convert to selects if we could remove undefined behavior instead.
+    if (passingValueIsAlwaysUndefined(OrigV, &PN) ||
+        passingValueIsAlwaysUndefined(ThenV, &PN))
+      return false;
+
+    HaveRewritablePHIs = true;
+    ConstantExpr *OrigCE = dyn_cast<ConstantExpr>(OrigV);
+    ConstantExpr *ThenCE = dyn_cast<ConstantExpr>(ThenV);
+    if (!OrigCE && !ThenCE)
+      continue; // Known safe and cheap.
+
+    if ((ThenCE && !isSafeToSpeculativelyExecute(ThenCE)) ||
+        (OrigCE && !isSafeToSpeculativelyExecute(OrigCE)))
+      return false;
+    unsigned OrigCost = OrigCE ? ComputeSpeculationCost(OrigCE, TTI) : 0;
+    unsigned ThenCost = ThenCE ? ComputeSpeculationCost(ThenCE, TTI) : 0;
+    unsigned MaxCost =
+        2 * PHINodeFoldingThreshold * TargetTransformInfo::TCC_Basic;
+    if (OrigCost + ThenCost > MaxCost)
+      return false;
+
+    // Account for the cost of an unfolded ConstantExpr which could end up
+    // getting expanded into Instructions.
+    // FIXME: This doesn't account for how many operations are combined in the
+    // constant expression.
+    ++SpeculatedInstructions;
+    if (SpeculatedInstructions > 1)
+      return false;
+  }
+
+  return HaveRewritablePHIs;
+}
+
 /// Speculate a conditional basic block flattening the CFG.
 ///
 /// Note that this is a very risky transform currently. Speculating
@@ -2035,6 +2100,8 @@ bool SimplifyCFGOpt::SpeculativelyExecuteBB(BranchInst *BI, BasicBlock *ThenBB,
 
   BasicBlock *BB = BI->getParent();
   BasicBlock *EndBB = ThenBB->getTerminator()->getSuccessor(0);
+  int BudgetRemaining =
+    PHINodeFoldingThreshold * TargetTransformInfo::TCC_Basic;
 
   // If ThenBB is actually on the false edge of the conditional branch, remember
   // to swap the select operands later.
@@ -2112,50 +2179,13 @@ bool SimplifyCFGOpt::SpeculativelyExecuteBB(BranchInst *BI, BasicBlock *ThenBB,
         return false;
     }
 
-  // Check that the PHI nodes can be converted to selects.
-  bool HaveRewritablePHIs = false;
-  for (PHINode &PN : EndBB->phis()) {
-    Value *OrigV = PN.getIncomingValueForBlock(BB);
-    Value *ThenV = PN.getIncomingValueForBlock(ThenBB);
-
-    // FIXME: Try to remove some of the duplication with HoistThenElseCodeToIf.
-    // Skip PHIs which are trivial.
-    if (ThenV == OrigV)
-      continue;
-
-    // Don't convert to selects if we could remove undefined behavior instead.
-    if (passingValueIsAlwaysUndefined(OrigV, &PN) ||
-        passingValueIsAlwaysUndefined(ThenV, &PN))
-      return false;
-
-    HaveRewritablePHIs = true;
-    ConstantExpr *OrigCE = dyn_cast<ConstantExpr>(OrigV);
-    ConstantExpr *ThenCE = dyn_cast<ConstantExpr>(ThenV);
-    if (!OrigCE && !ThenCE)
-      continue; // Known safe and cheap.
-
-    if ((ThenCE && !isSafeToSpeculativelyExecute(ThenCE)) ||
-        (OrigCE && !isSafeToSpeculativelyExecute(OrigCE)))
-      return false;
-    unsigned OrigCost = OrigCE ? ComputeSpeculationCost(OrigCE, TTI) : 0;
-    unsigned ThenCost = ThenCE ? ComputeSpeculationCost(ThenCE, TTI) : 0;
-    unsigned MaxCost =
-        2 * PHINodeFoldingThreshold * TargetTransformInfo::TCC_Basic;
-    if (OrigCost + ThenCost > MaxCost)
-      return false;
-
-    // Account for the cost of an unfolded ConstantExpr which could end up
-    // getting expanded into Instructions.
-    // FIXME: This doesn't account for how many operations are combined in the
-    // constant expression.
-    ++SpeculatedInstructions;
-    if (SpeculatedInstructions > 1)
-      return false;
-  }
-
-  // If there are no PHIs to process, bail early. This helps ensure idempotence
-  // as well.
-  if (!HaveRewritablePHIs && !(HoistCondStores && SpeculatedStoreValue))
+  // Check that we can insert the selects and that it's not too expensive to do
+  // so.
+  bool Convert = SpeculatedStore != nullptr;
+  Convert |= validateAndCostRequiredSelects(BB, ThenBB, EndBB,
+                                            SpeculatedInstructions,
+                                            BudgetRemaining, TTI);
+  if (!Convert || BudgetRemaining < 0)
     return false;
 
   // If we get here, we can hoist the instruction and if-convert.
@@ -2229,6 +2259,12 @@ static bool BlockIsSimpleEnoughToThreadThrough(BasicBlock *BB) {
   for (Instruction &I : BB->instructionsWithoutDebug()) {
     if (Size > MaxSmallBlockSize)
       return false; // Don't clone large BB's.
+
+    // Can't fold blocks that contain noduplicate or convergent calls.
+    if (CallInst *CI = dyn_cast<CallInst>(&I))
+      if (CI->cannotDuplicate() || CI->isConvergent())
+        return false;
+
     // We will delete Phis while threading, so Phis should not be accounted in
     // block's size
     if (!isa<PHINode>(I))
@@ -2268,13 +2304,6 @@ static bool FoldCondBranchOnPHI(BranchInst *BI, const DataLayout &DL,
 
   // Now we know that this block has multiple preds and two succs.
   if (!BlockIsSimpleEnoughToThreadThrough(BB))
-    return false;
-
-  // Can't fold blocks that contain noduplicate or convergent calls.
-  if (any_of(*BB, [](const Instruction &I) {
-        const CallInst *CI = dyn_cast<CallInst>(&I);
-        return CI && (CI->cannotDuplicate() || CI->isConvergent());
-      }))
     return false;
 
   // Okay, this is a simple enough basic block.  See if any phi values are
@@ -2404,11 +2433,13 @@ static bool FoldTwoEntryPHINode(PHINode *PN, const TargetTransformInfo &TTI,
   int BudgetRemaining =
       TwoEntryPHINodeFoldingThreshold * TargetTransformInfo::TCC_Basic;
 
+  bool Changed = false;
   for (BasicBlock::iterator II = BB->begin(); isa<PHINode>(II);) {
     PHINode *PN = cast<PHINode>(II++);
     if (Value *V = SimplifyInstruction(PN, {DL, PN})) {
       PN->replaceAllUsesWith(V);
       PN->eraseFromParent();
+      Changed = true;
       continue;
     }
 
@@ -2416,7 +2447,7 @@ static bool FoldTwoEntryPHINode(PHINode *PN, const TargetTransformInfo &TTI,
                              BudgetRemaining, TTI) ||
         !DominatesMergePoint(PN->getIncomingValue(1), BB, AggressiveInsts,
                              BudgetRemaining, TTI))
-      return false;
+      return Changed;
   }
 
   // If we folded the first phi, PN dangles at this point.  Refresh it.  If
@@ -2443,7 +2474,7 @@ static bool FoldTwoEntryPHINode(PHINode *PN, const TargetTransformInfo &TTI,
        isa<BinaryOperator>(IfCond)) &&
       !CanHoistNotFromBothValues(PN->getIncomingValue(0),
                                  PN->getIncomingValue(1)))
-    return false;
+    return Changed;
 
   // If all PHI nodes are promotable, check to make sure that all instructions
   // in the predecessor blocks can be promoted as well. If not, we won't be able
@@ -2461,7 +2492,7 @@ static bool FoldTwoEntryPHINode(PHINode *PN, const TargetTransformInfo &TTI,
         // This is not an aggressive instruction that we can promote.
         // Because of this, we won't be able to get rid of the control flow, so
         // the xform is not worth it.
-        return false;
+        return Changed;
       }
   }
 
@@ -2474,7 +2505,7 @@ static bool FoldTwoEntryPHINode(PHINode *PN, const TargetTransformInfo &TTI,
         // This is not an aggressive instruction that we can promote.
         // Because of this, we won't be able to get rid of the control flow, so
         // the xform is not worth it.
-        return false;
+        return Changed;
       }
   }
   assert(DomBlock && "Failed to find root DomBlock");
@@ -3125,7 +3156,7 @@ static bool mergeConditionalStoreToAddress(BasicBlock *PTB, BasicBlock *PFB,
     return true;
   };
 
-  const SmallVector<StoreInst *, 2> FreeStores = {PStore, QStore};
+  const std::array<StoreInst *, 2> FreeStores = {PStore, QStore};
   if (!MergeCondStoresAggressively &&
       (!IsWorthwhile(PTB, FreeStores) || !IsWorthwhile(PFB, FreeStores) ||
        !IsWorthwhile(QTB, FreeStores) || !IsWorthwhile(QFB, FreeStores)))
@@ -3951,17 +3982,36 @@ bool SimplifyCFGOpt::simplifyResume(ResumeInst *RI, IRBuilder<> &Builder) {
   return false;
 }
 
+// Check if cleanup block is empty
+static bool isCleanupBlockEmpty(iterator_range<BasicBlock::iterator> R) {
+  for (Instruction &I : R) {
+    auto *II = dyn_cast<IntrinsicInst>(&I);
+    if (!II)
+      return false;
+
+    Intrinsic::ID IntrinsicID = II->getIntrinsicID();
+    switch (IntrinsicID) {
+    case Intrinsic::dbg_declare:
+    case Intrinsic::dbg_value:
+    case Intrinsic::dbg_label:
+    case Intrinsic::lifetime_end:
+      break;
+    default:
+      return false;
+    }
+  }
+  return true;
+}
+
 // Simplify resume that is shared by several landing pads (phi of landing pad).
 bool SimplifyCFGOpt::simplifyCommonResume(ResumeInst *RI) {
   BasicBlock *BB = RI->getParent();
 
-  // Check that there are no other instructions except for debug intrinsics
-  // between the phi of landing pads (RI->getValue()) and resume instruction.
-  BasicBlock::iterator I = cast<Instruction>(RI->getValue())->getIterator(),
-                       E = RI->getIterator();
-  while (++I != E)
-    if (!isa<DbgInfoIntrinsic>(I))
-      return false;
+  // Check that there are no other instructions except for debug and lifetime
+  // intrinsics between the phi's and resume instruction.
+  if (!isCleanupBlockEmpty(
+          make_range(RI->getParent()->getFirstNonPHI(), BB->getTerminator())))
+    return false;
 
   SmallSetVector<BasicBlock *, 4> TrivialUnwindBlocks;
   auto *PhiLPInst = cast<PHINode>(RI->getValue());
@@ -3982,17 +4032,8 @@ bool SimplifyCFGOpt::simplifyCommonResume(ResumeInst *RI) {
     if (IncomingValue != LandingPad)
       continue;
 
-    bool isTrivial = true;
-
-    I = IncomingBB->getFirstNonPHI()->getIterator();
-    E = IncomingBB->getTerminator()->getIterator();
-    while (++I != E)
-      if (!isa<DbgInfoIntrinsic>(I)) {
-        isTrivial = false;
-        break;
-      }
-
-    if (isTrivial)
+    if (isCleanupBlockEmpty(
+            make_range(LandingPad->getNextNode(), IncomingBB->getTerminator())))
       TrivialUnwindBlocks.insert(IncomingBB);
   }
 
@@ -4012,6 +4053,7 @@ bool SimplifyCFGOpt::simplifyCommonResume(ResumeInst *RI) {
          PI != PE;) {
       BasicBlock *Pred = *PI++;
       removeUnwindEdge(Pred);
+      ++NumInvokes;
     }
 
     // In each SimplifyCFG run, only the current processed block can be erased.
@@ -4030,28 +4072,6 @@ bool SimplifyCFGOpt::simplifyCommonResume(ResumeInst *RI) {
   return !TrivialUnwindBlocks.empty();
 }
 
-// Check if cleanup block is empty
-static bool isCleanupBlockEmpty(Instruction *Inst, Instruction *RI) {
-  BasicBlock::iterator I = Inst->getIterator(), E = RI->getIterator();
-  while (++I != E) {
-    auto *II = dyn_cast<IntrinsicInst>(I);
-    if (!II)
-      return false;
-
-    Intrinsic::ID IntrinsicID = II->getIntrinsicID();
-    switch (IntrinsicID) {
-    case Intrinsic::dbg_declare:
-    case Intrinsic::dbg_value:
-    case Intrinsic::dbg_label:
-    case Intrinsic::lifetime_end:
-      break;
-    default:
-      return false;
-    }
-  }
-  return true;
-}
-
 // Simplify resume that is only used by a single (non-phi) landing pad.
 bool SimplifyCFGOpt::simplifySingleResume(ResumeInst *RI) {
   BasicBlock *BB = RI->getParent();
@@ -4060,13 +4080,15 @@ bool SimplifyCFGOpt::simplifySingleResume(ResumeInst *RI) {
          "Resume must unwind the exception that caused control to here");
 
   // Check that there are no other instructions except for debug intrinsics.
-  if (!isCleanupBlockEmpty(LPInst, RI))
+  if (!isCleanupBlockEmpty(
+          make_range<Instruction *>(LPInst->getNextNode(), RI)))
     return false;
 
   // Turn all invokes that unwind here into calls and delete the basic block.
   for (pred_iterator PI = pred_begin(BB), PE = pred_end(BB); PI != PE;) {
     BasicBlock *Pred = *PI++;
     removeUnwindEdge(Pred);
+    ++NumInvokes;
   }
 
   // The landingpad is now unreachable.  Zap it.
@@ -4097,7 +4119,8 @@ static bool removeEmptyCleanup(CleanupReturnInst *RI) {
     return false;
 
   // Check that there are no other instructions except for benign intrinsics.
-  if (!isCleanupBlockEmpty(CPInst, RI))
+  if (!isCleanupBlockEmpty(
+          make_range<Instruction *>(CPInst->getNextNode(), RI)))
     return false;
 
   // If the cleanup return we are simplifying unwinds to the caller, this will
@@ -4187,6 +4210,7 @@ static bool removeEmptyCleanup(CleanupReturnInst *RI) {
     BasicBlock *PredBB = *PI++;
     if (UnwindDest == nullptr) {
       removeUnwindEdge(PredBB);
+      ++NumInvokes;
     } else {
       Instruction *TI = PredBB->getTerminator();
       TI->replaceUsesOfWith(BB, UnwindDest);
@@ -6061,8 +6085,9 @@ bool SimplifyCFGOpt::simplifyCondBranch(BranchInst *BI, IRBuilder<> &Builder) {
   // can hoist it up to the branching block.
   if (BI->getSuccessor(0)->getSinglePredecessor()) {
     if (BI->getSuccessor(1)->getSinglePredecessor()) {
-      if (HoistThenElseCodeToIf(BI, TTI))
-        return requestResimplify();
+      if (HoistCommon && Options.HoistCommonInsts)
+        if (HoistThenElseCodeToIf(BI, TTI))
+          return requestResimplify();
     } else {
       // If Successor #1 has multiple preds, we may be able to conditionally
       // execute Successor #0 if it branches to Successor #1.

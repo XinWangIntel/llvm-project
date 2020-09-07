@@ -149,9 +149,9 @@ cl::opt<bool> EnableOrderFileInstrumentation(
     "enable-order-file-instrumentation", cl::init(false), cl::Hidden,
     cl::desc("Enable order file instrumentation (default = off)"));
 
-static cl::opt<bool>
-    EnableMatrix("enable-matrix", cl::init(false), cl::Hidden,
-                 cl::desc("Enable lowering of the matrix intrinsics"));
+cl::opt<bool> EnableMatrix(
+    "enable-matrix", cl::init(false), cl::Hidden,
+    cl::desc("Enable lowering of the matrix intrinsics"));
 
 cl::opt<AttributorRunOption> AttributorRun(
     "attributor-enable", cl::Hidden, cl::init(AttributorRunOption::NONE),
@@ -298,8 +298,8 @@ void PassManagerBuilder::populateFunctionPassManager(
   // Make sure they are also lowered in O0.
   // FIXME: A lightweight version of the pass should run in the backend
   //        pipeline on demand.
-  if (EnableMatrix)
-    FPM.add(createLowerMatrixIntrinsicsPass());
+  if (EnableMatrix && OptLevel == 0)
+    FPM.add(createLowerMatrixIntrinsicsMinimalPass());
 
   if (OptLevel == 0) return;
 
@@ -1011,13 +1011,13 @@ void PassManagerBuilder::addLTOOptimizationPasses(legacy::PassManagerBase &PM) {
   PM.add(createGlobalsAAWrapperPass()); // IP alias analysis.
 
   PM.add(createLICMPass(LicmMssaOptCap, LicmMssaNoAccForPromotionCap));
-  PM.add(createMergedLoadStoreMotionPass()); // Merge ld/st in diamonds.
   PM.add(NewGVN ? createNewGVNPass()
                 : createGVNPass(DisableGVNLoadPRE)); // Remove redundancies.
   PM.add(createMemCpyOptPass());            // Remove dead memcpys.
 
   // Nuke dead stores.
   PM.add(createDeadStoreEliminationPass());
+  PM.add(createMergedLoadStoreMotionPass()); // Merge ld/st in diamonds.
 
   // More loops are countable; try to optimize them.
   PM.add(createIndVarSimplifyPass());

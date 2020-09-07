@@ -232,6 +232,10 @@ private:
   // operand's type as all results' types.
   void genUseOperandAsResultTypeCollectiveParamBuilder();
 
+  // Returns true if the inferred collective param build method should be
+  // generated.
+  bool shouldGenerateInferredTypeCollectiveParamBuilder();
+
   // Generates the build() method that takes aggregate operands/attributes
   // parameters. This build() method uses inferred types as result types.
   // Requires: The type needs to be inferable via InferTypeOpInterface.
@@ -339,7 +343,7 @@ private:
 // - attrGet corresponds to the name of the function to call to get value of
 //   attribute (the generated function call returns an Attribute);
 // - operandGet corresponds to the name of the function with which to retrieve
-//   an operand (the generaed function call returns an OperandRange);
+//   an operand (the generated function call returns an OperandRange);
 // - reultGet corresponds to the name of the function to get an result (the
 //   generated function call returns a ValueRange);
 static void populateSubstitutions(const Operator &op, const char *attrGet,
@@ -984,40 +988,37 @@ void OpEmitter::genSeparateArgParamBuilder() {
   //          result
   //
   // In that case, skip generating such ambiguous build methods here.
-  bool hasSingleVariadicResult =
-      op.getNumResults() == 1 && op.getResult(0).isVariadic();
-
-  bool hasSingleVariadicArg =
-      op.getNumArgs() == 1 &&
-      op.getArg(0).is<tblgen::NamedTypeConstraint *>() &&
-      op.getOperand(0).isVariadic();
-  bool hasNoVariadicRegions = op.getNumVariadicRegions() == 0;
-
   for (auto attrType : attrBuilderType) {
     // Case 3b above.
-    if (!(hasNoVariadicRegions && hasSingleVariadicArg &&
-          hasSingleVariadicResult))
+    if (!(op.hasNoVariadicRegions() && op.hasSingleVariadicArg() &&
+          op.hasSingleVariadicResult()))
       emit(attrType, TypeParamKind::Separate, /*inferType=*/false);
-    if (canInferType(op))
-      emit(attrType, TypeParamKind::None, /*inferType=*/true);
+    if (canInferType(op)) {
+      // When inferType = true, the generated build method does not have
+      // result types. If the op has a single variadic arg, then this build
+      // method will be ambiguous with the collective inferred build method
+      // generated in `genInferredTypeCollectiveParamBuilder`. If we are going
+      // to generate that collective inferred method, suppress generating the
+      // ambiguous build method here.
+      bool buildMethodAmbiguous =
+          op.hasSingleVariadicArg() &&
+          shouldGenerateInferredTypeCollectiveParamBuilder();
+      if (!buildMethodAmbiguous)
+        emit(attrType, TypeParamKind::None, /*inferType=*/true);
+    }
     // The separate arg + collective param kind method will be:
     // (a) Same as the separate arg + separate param kind method if there is
     //     only one variadic result.
     // (b) Ambiguous with the collective params method under conditions in (3a)
     //     above.
     // In either case, skip generating such build method.
-    if (!hasSingleVariadicResult &&
-        !(hasNoVariadicRegions && hasSingleVariadicArg))
+    if (!op.hasSingleVariadicResult() &&
+        !(op.hasNoVariadicRegions() && op.hasSingleVariadicArg()))
       emit(attrType, TypeParamKind::Collective, /*inferType=*/false);
   }
 }
 
 void OpEmitter::genUseOperandAsResultTypeCollectiveParamBuilder() {
-  // If this op has a variadic result, we cannot generate this builder because
-  // we don't know how many results to create.
-  if (op.getNumVariableLengthResults() != 0)
-    return;
-
   int numResults = op.getNumResults();
 
   // Signature
@@ -1026,8 +1027,12 @@ void OpEmitter::genUseOperandAsResultTypeCollectiveParamBuilder() {
       builderOpState +
       ", ::mlir::ValueRange operands, ::llvm::ArrayRef<::mlir::NamedAttribute> "
       "attributes";
-  if (op.getNumVariadicRegions())
+  if (op.getNumVariadicRegions()) {
     params += ", unsigned numRegions";
+  } else {
+    // Provide default value for `attributes` since its the last parameter
+    params += " = {}";
+  }
   auto &m = opClass.newMethod("void", "build", params, OpMethod::MP_Static);
   auto &body = m.body();
 
@@ -1051,15 +1056,18 @@ void OpEmitter::genUseOperandAsResultTypeCollectiveParamBuilder() {
        << llvm::join(resultTypes, ", ") << "});\n\n";
 }
 
+bool OpEmitter::shouldGenerateInferredTypeCollectiveParamBuilder() {
+  return canInferType(op) && op.getNumSuccessors() == 0;
+}
+
 void OpEmitter::genInferredTypeCollectiveParamBuilder() {
   // TODO: Expand to support regions.
-  const char *params =
-      "::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &{0}, "
-      "::mlir::ValueRange operands, ::llvm::ArrayRef<::mlir::NamedAttribute> "
-      "attributes";
-  auto &m =
-      opClass.newMethod("void", "build", formatv(params, builderOpState).str(),
-                        OpMethod::MP_Static);
+  std::string params =
+      std::string("::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &") +
+      builderOpState +
+      ", ::mlir::ValueRange operands, ::llvm::ArrayRef<::mlir::NamedAttribute> "
+      "attributes = {}";
+  auto &m = opClass.newMethod("void", "build", params, OpMethod::MP_Static);
   auto &body = m.body();
 
   int numResults = op.getNumResults();
@@ -1206,8 +1214,21 @@ void OpEmitter::genBuilder() {
   //    to facilitate different call patterns.
   if (op.getNumVariableLengthResults() == 0) {
     if (op.getTrait("OpTrait::SameOperandsAndResultType")) {
-      genUseOperandAsResultTypeSeparateParamBuilder();
-      genUseOperandAsResultTypeCollectiveParamBuilder();
+      // If the operation has a single variadic input, then the build method
+      // generated by `genUseOperandAsResultTypeSeparateParamBuilder` will be
+      // ambiguous with the one generated by
+      // `genUseOperandAsResultTypeCollectiveParamBuilder` (they both will have
+      // a single `ValueRange` argument for operands, and the collective one
+      // will have a `ArrayRef<NamedAttribute>` argument initialized to empty).
+      // Suppress such ambiguous build method.
+      if (!op.hasSingleVariadicArg())
+        genUseOperandAsResultTypeSeparateParamBuilder();
+
+      // The build method generated by the inferred type collective param
+      // builder and one generated here have the same arguments and hence
+      // generating both will be ambiguous. Enable just one of them.
+      if (!shouldGenerateInferredTypeCollectiveParamBuilder())
+        genUseOperandAsResultTypeCollectiveParamBuilder();
     }
     if (op.getTrait("OpTrait::FirstAttrDerivedResultType"))
       genUseAttrAsResultTypeBuilder();
@@ -1266,7 +1287,7 @@ void OpEmitter::genCollectiveParamBuilder() {
 
   // Generate builder that infers type too.
   // TODO: Expand to handle regions and successors.
-  if (canInferType(op) && op.getNumSuccessors() == 0)
+  if (shouldGenerateInferredTypeCollectiveParamBuilder())
     genInferredTypeCollectiveParamBuilder();
 }
 

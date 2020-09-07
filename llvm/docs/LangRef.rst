@@ -1066,6 +1066,30 @@ Currently, only the following parameter attributes are defined:
     site. If the alignment is not specified, then the code generator
     makes a target-specific assumption.
 
+.. _attr_byref:
+
+``byref(<ty>)``
+
+    The ``byref`` argument attribute allows specifying the pointee
+    memory type of an argument. This is similar to ``byval``, but does
+    not imply a copy is made anywhere, or that the argument is passed
+    on the stack. This implies the pointer is dereferenceable up to
+    the storage size of the type.
+
+    It is not generally permissible to introduce a write to an
+    ``byref`` pointer. The pointer may have any address space and may
+    be read only.
+
+    This is not a valid attribute for return values.
+
+    The alignment for an ``byref`` parameter can be explicitly
+    specified by combining it with the ``align`` attribute, similar to
+    ``byval``. If the alignment is not specified, then the code generator
+    makes a target-specific assumption.
+
+    This is intended for representing ABI constraints, and is not
+    intended to be inferred for optimization use.
+
 .. _attr_preallocated:
 
 ``preallocated(<ty>)``
@@ -1133,10 +1157,11 @@ Currently, only the following parameter attributes are defined:
 ``align <n>`` or ``align(<n>)``
     This indicates that the pointer value may be assumed by the optimizer to
     have the specified alignment.  If the pointer value does not have the
-    specified alignment, behavior is undefined.
+    specified alignment, behavior is undefined. ``align 1`` has no effect on
+    non-byval, non-preallocated arguments.
 
     Note that this attribute has additional semantics when combined with the
-    ``byval`` attribute, which are documented there.
+    ``byval`` or ``preallocated`` attribute, which are documented there.
 
 .. _noalias:
 
@@ -2157,6 +2182,12 @@ between GC strategies requires additional code generation at the call
 site, these bundles may contain any values that are needed by the
 generated code.  For more details, see :ref:`GC Transitions
 <gc_transition_args>`.
+
+The bundle contain an arbitrary list of Values which need to be passed
+to GC transition code. They will be lowered and passed as operands to
+the appropriate GC_TRANSITION nodes in the selection DAG. It is assumed
+that these arguments must be available before and after (but not
+necessarily during) the execution of the callee.
 
 .. _assume_opbundles:
 
@@ -3523,6 +3554,9 @@ uses with" concept would not hold.
 To ensure all uses of a given register observe the same value (even if
 '``undef``'), the :ref:`freeze instruction <i_freeze>` can be used.
 A value is frozen if its uses see the same value.
+An aggregate value or vector is frozen if its elements are frozen.
+The padding of an aggregate isn't considered, since it isn't visible
+without storing it into memory and loading it with a different type.
 
 .. code-block:: llvm
 
@@ -4283,14 +4317,9 @@ PowerPC:
 - ``r``: A 32 or 64-bit integer register.
 - ``b``: A 32 or 64-bit integer register, excluding ``R0`` (that is:
   ``R1-R31``).
-- ``f``: A 32 or 64-bit float register (``F0-F31``), or when QPX is enabled, a
-  128 or 256-bit QPX register (``Q0-Q31``; aliases the ``F`` registers).
-- ``v``: For ``4 x f32`` or ``4 x f64`` types, when QPX is enabled, a
-  128 or 256-bit QPX register (``Q0-Q31``), otherwise a 128-bit
-  altivec vector register (``V0-V31``).
-
-  .. FIXME: is this a bug that v accepts QPX registers? I think this
-     is supposed to only use the altivec vector registers?
+- ``f``: A 32 or 64-bit float register (``F0-F31``), 
+- ``v``: For ``4 x f32`` or ``4 x f64`` types, a 128-bit altivec vector
+   register (``V0-V31``).
 
 - ``y``: Condition register (``CR0-CR7``).
 - ``wc``: An individual CR bit in a CR register.
@@ -4859,7 +4888,12 @@ DIExpression that describes how to get from an object's address to the actual
 raw data, if they aren't equivalent. This is only supported for array types,
 particularly to describe Fortran arrays, which have an array descriptor in
 addition to the array data. Alternatively it can also be DIVariable which
-has the address of the actual raw data.
+has the address of the actual raw data. The Fortran language supports pointer
+arrays which can be attached to actual arrays, this attachment between pointer
+and pointee is called association.  The optional ``associated`` is a
+DIExpression that describes whether the pointer array is currently associated.
+The optional ``allocated`` is a DIExpression that describes whether the
+allocatable array is currently allocated.
 
 For ``DW_TAG_enumeration_type``, the ``elements:`` should be :ref:`enumerator
 descriptors <DIEnumerator>`, each representing the definition of an enumeration
@@ -6160,7 +6194,8 @@ considered having this property if at least one of the access groups
 matches the ``llvm.loop.parallel_accesses`` list.
 
 If all memory-accessing instructions in a loop have
-``llvm.loop.parallel_accesses`` metadata that refers to that loop, then the
+``llvm.access.group`` metadata that each refer to one of the access
+groups of a loop's ``llvm.loop.parallel_accesses`` metadata, then the
 loop has no loop carried memory dependences and is considered to be a
 parallel loop.
 
@@ -6850,7 +6885,7 @@ where the first ``param`` is the number of the parameter it describes,
 which can be accessed by the function. This range does not include accesses by
 function calls from ``calls`` list.
 
-where each ``Callee`` decribes how parameter is forwared into other
+where each ``Callee`` describes how parameter is forwarded into other
 functions and looks like:
 
 .. code-block:: text
@@ -6888,7 +6923,7 @@ We can expect the record like this:
 
     params: ((param: 0, offset: [0, 7]),(param: 2, offset: [5, 5], calls: ((callee: ^3, param: 1, offset: [-128, 127]))))
 
-The function may access just 8 bytes of the paramenter %0 . ``calls`` is empty,
+The function may access just 8 bytes of the parameter %0 . ``calls`` is empty,
 so the parameter is either not used for function calls or ``offset`` already
 covers all accesses from nested function calls.
 Parameter %1 escapes, so access is unknown.
@@ -9205,6 +9240,9 @@ example, loading an ``i24`` reads at most three bytes. When loading a
 value of a type like ``i20`` with a size that is not an integral number
 of bytes, the result is undefined if the value was not originally
 written using a store of the same type.
+If the value being loaded is of aggregate type, the bytes that correspond to
+padding may be accessed but are ignored, because it is impossible to observe
+padding from the loaded aggregate value.
 
 Examples:
 """""""""
@@ -9294,6 +9332,8 @@ example, storing an ``i24`` writes at most three bytes. When writing a
 value of a type like ``i20`` with a size that is not an integral number
 of bytes, it is unspecified what happens to the extra bits that do not
 belong to the type, but they will typically be overwritten.
+If ``<value>`` is of aggregate type, padding is filled with
+:ref:`undef <undefvalues>`.
 
 Example:
 """"""""
@@ -10682,6 +10722,9 @@ instructions may yield different values.
 While ``undef`` and ``poison`` pointers can be frozen, the result is a
 non-dereferenceable pointer. See the
 :ref:`Pointer Aliasing Rules <pointeraliasing>` section for more information.
+If an aggregate value or vector is frozen, the operand is frozen element-wise.
+The padding of an aggregate isn't considered, since it isn't visible
+without storing it into memory and loading it with a different type.
 
 
 Example:
@@ -12223,13 +12266,171 @@ Example:
         call void @llvm.call.preallocated.teardown(token %cs)
         ret void
 
-Standard C Library Intrinsics
------------------------------
+Standard C/C++ Library Intrinsics
+---------------------------------
 
-LLVM provides intrinsics for a few important standard C library
+LLVM provides intrinsics for a few important standard C/C++ library
 functions. These intrinsics allow source-language front-ends to pass
 information about the alignment of the pointer arguments to the code
 generator, providing opportunity for more efficient code generation.
+
+
+'``llvm.abs.*``' Intrinsic
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Syntax:
+"""""""
+
+This is an overloaded intrinsic. You can use ``llvm.abs`` on any
+integer bit width or any vector of integer elements.
+
+::
+
+      declare i32 @llvm.abs.i32(i32 <src>, i1 <is_int_min_poison>)
+      declare <4 x i32> @llvm.abs.v4i32(<4 x i32> <src>, i1 <is_int_min_poison>)
+
+Overview:
+"""""""""
+
+The '``llvm.abs``' family of intrinsic functions returns the absolute value
+of an argument.
+
+Arguments:
+""""""""""
+
+The first argument is the value for which the absolute value is to be returned.
+This argument may be of any integer type or a vector with integer element type.
+The return type must match the first argument type.
+
+The second argument must be a constant and is a flag to indicate whether the
+result value of the '``llvm.abs``' intrinsic is a
+:ref:`poison value <poisonvalues>` if the argument is statically or dynamically
+an ``INT_MIN`` value.
+
+Semantics:
+""""""""""
+
+The '``llvm.abs``' intrinsic returns the magnitude (always positive) of the
+argument or each element of a vector argument.". If the argument is ``INT_MIN``,
+then the result is also ``INT_MIN`` if ``is_int_min_poison == 0`` and
+``poison`` otherwise.
+
+
+'``llvm.smax.*``' Intrinsic
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Syntax:
+"""""""
+
+This is an overloaded intrinsic. You can use ``@llvm.smax`` on any
+integer bit width or any vector of integer elements.
+
+::
+
+      declare i32 @llvm.smax.i32(i32 %a, i32 %b)
+      declare <4 x i32> @llvm.smax.v4i32(<4 x i32> %a, <4 x i32> %b)
+
+Overview:
+"""""""""
+
+Return the larger of ``%a`` and ``%b`` comparing the values as signed integers.
+Vector intrinsics operate on a per-element basis. The larger element of ``%a``
+and ``%b`` at a given index is returned for that index.
+
+Arguments:
+""""""""""
+
+The arguments (``%a`` and ``%b``) may be of any integer type or a vector with
+integer element type. The argument types must match each other, and the return
+type must match the argument type.
+
+
+'``llvm.smin.*``' Intrinsic
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Syntax:
+"""""""
+
+This is an overloaded intrinsic. You can use ``@llvm.smin`` on any
+integer bit width or any vector of integer elements.
+
+::
+
+      declare i32 @llvm.smin.i32(i32 %a, i32 %b)
+      declare <4 x i32> @llvm.smin.v4i32(<4 x i32> %a, <4 x i32> %b)
+
+Overview:
+"""""""""
+
+Return the smaller of ``%a`` and ``%b`` comparing the values as signed integers.
+Vector intrinsics operate on a per-element basis. The smaller element of ``%a``
+and ``%b`` at a given index is returned for that index.
+
+Arguments:
+""""""""""
+
+The arguments (``%a`` and ``%b``) may be of any integer type or a vector with
+integer element type. The argument types must match each other, and the return
+type must match the argument type.
+
+
+'``llvm.umax.*``' Intrinsic
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Syntax:
+"""""""
+
+This is an overloaded intrinsic. You can use ``@llvm.umax`` on any
+integer bit width or any vector of integer elements.
+
+::
+
+      declare i32 @llvm.umax.i32(i32 %a, i32 %b)
+      declare <4 x i32> @llvm.umax.v4i32(<4 x i32> %a, <4 x i32> %b)
+
+Overview:
+"""""""""
+
+Return the larger of ``%a`` and ``%b`` comparing the values as unsigned
+integers. Vector intrinsics operate on a per-element basis. The larger element
+of ``%a`` and ``%b`` at a given index is returned for that index.
+
+Arguments:
+""""""""""
+
+The arguments (``%a`` and ``%b``) may be of any integer type or a vector with
+integer element type. The argument types must match each other, and the return
+type must match the argument type.
+
+
+'``llvm.umin.*``' Intrinsic
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Syntax:
+"""""""
+
+This is an overloaded intrinsic. You can use ``@llvm.umin`` on any
+integer bit width or any vector of integer elements.
+
+::
+
+      declare i32 @llvm.umin.i32(i32 %a, i32 %b)
+      declare <4 x i32> @llvm.umin.v4i32(<4 x i32> %a, <4 x i32> %b)
+
+Overview:
+"""""""""
+
+Return the smaller of ``%a`` and ``%b`` comparing the values as unsigned
+integers. Vector intrinsics operate on a per-element basis. The smaller element
+of ``%a`` and ``%b`` at a given index is returned for that index.
+
+Arguments:
+""""""""""
+
+The arguments (``%a`` and ``%b``) may be of any integer type or a vector with
+integer element type. The argument types must match each other, and the return
+type must match the argument type.
+
 
 .. _int_memcpy:
 
@@ -12278,14 +12479,14 @@ very cleanly specified and it is unwise to depend on it.
 Semantics:
 """"""""""
 
-The '``llvm.memcpy.*``' intrinsics copy a block of memory from the
-source location to the destination location, which are not allowed to
-overlap. It copies "len" bytes of memory over. If the argument is known
-to be aligned to some boundary, this can be specified as an attribute on
-the argument.
+The '``llvm.memcpy.*``' intrinsics copy a block of memory from the source
+location to the destination location, which must either be equal or
+non-overlapping. It copies "len" bytes of memory over. If the argument is known
+to be aligned to some boundary, this can be specified as an attribute on the
+argument.
 
-If "len" is 0, the pointers may be NULL or dangling. However, they must still
-be appropriately aligned.
+If "len" is 0, the pointers may be NULL, dangling, ``undef``, or ``poison``
+pointers. However, they must still be appropriately aligned.
 
 .. _int_memcpy_inline:
 
@@ -12341,8 +12542,8 @@ overlap. It copies "len" bytes of memory over. If the argument is known
 to be aligned to some boundary, this can be specified as an attribute on
 the argument.
 
-If "len" is 0, the pointers may be NULL or dangling. However, they must still
-be appropriately aligned.
+If "len" is 0, the pointers may be NULL, dangling, ``undef``, or ``poison``
+pointers. However, they must still be appropriately aligned.
 
 The generated code is guaranteed not to call any external functions.
 
@@ -12401,8 +12602,8 @@ copies "len" bytes of memory over. If the argument is known to be
 aligned to some boundary, this can be specified as an attribute on
 the argument.
 
-If "len" is 0, the pointers may be NULL or dangling. However, they must still
-be appropriately aligned.
+If "len" is 0, the pointers may be NULL, dangling, ``undef``, or ``poison``
+pointers. However, they must still be appropriately aligned.
 
 .. _int_memset:
 
@@ -12456,8 +12657,8 @@ at the destination location. If the argument is known to be
 aligned to some boundary, this can be specified as an attribute on
 the argument.
 
-If "len" is 0, the pointers may be NULL or dangling. However, they must still
-be appropriately aligned.
+If "len" is 0, the pointer may be NULL, dangling, ``undef``, or ``poison``
+pointer. However, it must still be appropriately aligned.
 
 '``llvm.sqrt.*``' Intrinsic
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -14170,7 +14371,7 @@ minimum.
 
 
 '``llvm.sadd.sat.*``' Intrinsics
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Syntax
 """""""
@@ -14189,7 +14390,7 @@ Overview
 """""""""
 
 The '``llvm.sadd.sat``' family of intrinsic functions perform signed
-saturation addition on the 2 arguments.
+saturating addition on the 2 arguments.
 
 Arguments
 """"""""""
@@ -14218,7 +14419,7 @@ Examples
 
 
 '``llvm.uadd.sat.*``' Intrinsics
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Syntax
 """""""
@@ -14237,7 +14438,7 @@ Overview
 """""""""
 
 The '``llvm.uadd.sat``' family of intrinsic functions perform unsigned
-saturation addition on the 2 arguments.
+saturating addition on the 2 arguments.
 
 Arguments
 """"""""""
@@ -14265,7 +14466,7 @@ Examples
 
 
 '``llvm.ssub.sat.*``' Intrinsics
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Syntax
 """""""
@@ -14284,7 +14485,7 @@ Overview
 """""""""
 
 The '``llvm.ssub.sat``' family of intrinsic functions perform signed
-saturation subtraction on the 2 arguments.
+saturating subtraction on the 2 arguments.
 
 Arguments
 """"""""""
@@ -14313,7 +14514,7 @@ Examples
 
 
 '``llvm.usub.sat.*``' Intrinsics
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Syntax
 """""""
@@ -14332,7 +14533,7 @@ Overview
 """""""""
 
 The '``llvm.usub.sat``' family of intrinsic functions perform unsigned
-saturation subtraction on the 2 arguments.
+saturating subtraction on the 2 arguments.
 
 Arguments
 """"""""""
@@ -14357,6 +14558,108 @@ Examples
 
       %res = call i4 @llvm.usub.sat.i4(i4 2, i4 1)  ; %res = 1
       %res = call i4 @llvm.usub.sat.i4(i4 2, i4 6)  ; %res = 0
+
+
+'``llvm.sshl.sat.*``' Intrinsics
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Syntax
+"""""""
+
+This is an overloaded intrinsic. You can use ``llvm.sshl.sat``
+on integers or vectors of integers of any bit width.
+
+::
+
+      declare i16 @llvm.sshl.sat.i16(i16 %a, i16 %b)
+      declare i32 @llvm.sshl.sat.i32(i32 %a, i32 %b)
+      declare i64 @llvm.sshl.sat.i64(i64 %a, i64 %b)
+      declare <4 x i32> @llvm.sshl.sat.v4i32(<4 x i32> %a, <4 x i32> %b)
+
+Overview
+"""""""""
+
+The '``llvm.sshl.sat``' family of intrinsic functions perform signed
+saturating left shift on the first argument.
+
+Arguments
+""""""""""
+
+The arguments (``%a`` and ``%b``) and the result may be of integer types of any
+bit width, but they must have the same bit width. ``%a`` is the value to be
+shifted, and ``%b`` is the amount to shift by. If ``b`` is (statically or
+dynamically) equal to or larger than the integer bit width of the arguments,
+the result is a :ref:`poison value <poisonvalues>`. If the arguments are
+vectors, each vector element of ``a`` is shifted by the corresponding shift
+amount in ``b``.
+
+
+Semantics:
+""""""""""
+
+The maximum value this operation can clamp to is the largest signed value
+representable by the bit width of the arguments. The minimum value is the
+smallest signed value representable by this bit width.
+
+
+Examples
+"""""""""
+
+.. code-block:: llvm
+
+      %res = call i4 @llvm.sshl.sat.i4(i4 2, i4 1)  ; %res = 4
+      %res = call i4 @llvm.sshl.sat.i4(i4 2, i4 2)  ; %res = 7
+      %res = call i4 @llvm.sshl.sat.i4(i4 -5, i4 1)  ; %res = -8
+      %res = call i4 @llvm.sshl.sat.i4(i4 -1, i4 1)  ; %res = -2
+
+
+'``llvm.ushl.sat.*``' Intrinsics
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Syntax
+"""""""
+
+This is an overloaded intrinsic. You can use ``llvm.ushl.sat``
+on integers or vectors of integers of any bit width.
+
+::
+
+      declare i16 @llvm.ushl.sat.i16(i16 %a, i16 %b)
+      declare i32 @llvm.ushl.sat.i32(i32 %a, i32 %b)
+      declare i64 @llvm.ushl.sat.i64(i64 %a, i64 %b)
+      declare <4 x i32> @llvm.ushl.sat.v4i32(<4 x i32> %a, <4 x i32> %b)
+
+Overview
+"""""""""
+
+The '``llvm.ushl.sat``' family of intrinsic functions perform unsigned
+saturating left shift on the first argument.
+
+Arguments
+""""""""""
+
+The arguments (``%a`` and ``%b``) and the result may be of integer types of any
+bit width, but they must have the same bit width. ``%a`` is the value to be
+shifted, and ``%b`` is the amount to shift by. If ``b`` is (statically or
+dynamically) equal to or larger than the integer bit width of the arguments,
+the result is a :ref:`poison value <poisonvalues>`. If the arguments are
+vectors, each vector element of ``a`` is shifted by the corresponding shift
+amount in ``b``.
+
+Semantics:
+""""""""""
+
+The maximum value this operation can clamp to is the largest unsigned value
+representable by the bit width of the arguments.
+
+
+Examples
+"""""""""
+
+.. code-block:: llvm
+
+      %res = call i4 @llvm.ushl.sat.i4(i4 2, i4 1)  ; %res = 4
+      %res = call i4 @llvm.ushl.sat.i4(i4 3, i4 3)  ; %res = 15
 
 
 Fixed Point Arithmetic Intrinsics
@@ -14414,7 +14717,7 @@ be less than 1/2^(scale).
 
 
 '``llvm.smul.fix.*``' Intrinsics
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Syntax
 """""""
@@ -14474,7 +14777,7 @@ Examples
 
 
 '``llvm.umul.fix.*``' Intrinsics
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Syntax
 """""""
@@ -14533,7 +14836,7 @@ Examples
 
 
 '``llvm.smul.fix.sat.*``' Intrinsics
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Syntax
 """""""
@@ -14552,7 +14855,7 @@ Overview
 """""""""
 
 The '``llvm.smul.fix.sat``' family of intrinsic functions perform signed
-fixed point saturation multiplication on 2 arguments of the same scale.
+fixed point saturating multiplication on 2 arguments of the same scale.
 
 Arguments
 """"""""""
@@ -14603,7 +14906,7 @@ Examples
 
 
 '``llvm.umul.fix.sat.*``' Intrinsics
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Syntax
 """""""
@@ -14622,7 +14925,7 @@ Overview
 """""""""
 
 The '``llvm.umul.fix.sat``' family of intrinsic functions perform unsigned
-fixed point saturation multiplication on 2 arguments of the same scale.
+fixed point saturating multiplication on 2 arguments of the same scale.
 
 Arguments
 """"""""""
@@ -14670,7 +14973,7 @@ Examples
 
 
 '``llvm.sdiv.fix.*``' Intrinsics
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Syntax
 """""""
@@ -14730,7 +15033,7 @@ Examples
 
 
 '``llvm.udiv.fix.*``' Intrinsics
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Syntax
 """""""
@@ -14790,7 +15093,7 @@ Examples
 
 
 '``llvm.sdiv.fix.sat.*``' Intrinsics
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Syntax
 """""""
@@ -14809,7 +15112,7 @@ Overview
 """""""""
 
 The '``llvm.sdiv.fix.sat``' family of intrinsic functions perform signed
-fixed point saturation division on 2 arguments of the same scale.
+fixed point saturating division on 2 arguments of the same scale.
 
 Arguments
 """"""""""
@@ -14857,7 +15160,7 @@ Examples
 
 
 '``llvm.udiv.fix.sat.*``' Intrinsics
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Syntax
 """""""
@@ -14876,7 +15179,7 @@ Overview
 """""""""
 
 The '``llvm.udiv.fix.sat``' family of intrinsic functions perform unsigned
-fixed point saturation division on 2 arguments of the same scale.
+fixed point saturating division on 2 arguments of the same scale.
 
 Arguments
 """"""""""
@@ -15649,8 +15952,8 @@ Arguments:
 """"""""""
 
 The first argument ``%Ptr`` is a pointer type to the returned vector type, and
-correponds to the start address to load from. The second argument ``%Stride``
-is a postive, constant integer with ``%Stride >= <Rows>``. ``%Stride`` is used
+corresponds to the start address to load from. The second argument ``%Stride``
+is a positive, constant integer with ``%Stride >= <Rows>``. ``%Stride`` is used
 to compute the column memory addresses. I.e., for a column ``C``, its start
 memory addresses is calculated with ``%Ptr + C * %Stride``. The third Argument
 ``<IsVolatile>`` is a boolean value.  The fourth and fifth arguments,
@@ -16634,27 +16937,28 @@ to:
 
 ::
 
-      %m[i] = icmp ule (%base + i), %n
+      %m[i] = icmp ult (%base + i), %n
 
 where ``%m`` is a vector (mask) of active/inactive lanes with its elements
 indexed by ``i``,  and ``%base``, ``%n`` are the two arguments to
-``llvm.get.active.lane.mask.*``, ``%imcp`` is an integer compare and ``ule``
-the unsigned less-than-equal comparison operator.  Overflow cannot occur in
+``llvm.get.active.lane.mask.*``, ``%icmp`` is an integer compare and ``ult``
+the unsigned less-than comparison operator.  Overflow cannot occur in
 ``(%base + i)`` and its comparison against ``%n`` as it is performed in integer
-numbers and not in machine numbers.  The above is equivalent to:
+numbers and not in machine numbers.  If ``%n`` is ``0``, then the result is a
+poison value. The above is equivalent to:
 
 ::
 
       %m = @llvm.get.active.lane.mask(%base, %n)
 
-This can, for example, be emitted by the loop vectorizer. Then, ``%base`` is
-the first element of the vector induction variable (VIV), and ``%n`` is the
-Back-edge Taken Count (BTC). Thus, these intrinsics perform an element-wise
-less than or equal comparison of VIV with BTC, producing a mask of true/false
-values representing active/inactive vector lanes, except if the VIV overflows
-in which case they return false in the lanes where the VIV overflows.  The
-arguments are scalar types to accomodate scalable vector types, for which it is
-unknown what the type of the step vector needs to be that enumerate its
+This can, for example, be emitted by the loop vectorizer in which case
+``%base`` is the first element of the vector induction variable (VIV) and
+``%n`` is the loop tripcount. Thus, these intrinsics perform an element-wise
+less than comparison of VIV with the loop tripcount, producing a mask of
+true/false values representing active/inactive vector lanes, except if the VIV
+overflows in which case they return false in the lanes where the VIV overflows.
+The arguments are scalar types to accommodate scalable vector types, for which
+it is unknown what the type of the step vector needs to be that enumerate its
 lanes without overflow.
 
 This mask ``%m`` can e.g. be used in masked load/store instructions. These

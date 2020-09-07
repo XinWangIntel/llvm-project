@@ -534,20 +534,6 @@ def NEONvtbl1     : SDNode<"ARMISD::VTBL1", SDTARMVTBL1>;
 def NEONvtbl2     : SDNode<"ARMISD::VTBL2", SDTARMVTBL2>;
 
 
-def NEONimmAllZerosV: PatLeaf<(ARMvmovImm (i32 timm)), [{
-  ConstantSDNode *ConstVal = cast<ConstantSDNode>(N->getOperand(0));
-  unsigned EltBits = 0;
-  uint64_t EltVal = ARM_AM::decodeVMOVModImm(ConstVal->getZExtValue(), EltBits);
-  return (EltBits == 32 && EltVal == 0);
-}]>;
-
-def NEONimmAllOnesV: PatLeaf<(ARMvmovImm (i32 timm)), [{
-  ConstantSDNode *ConstVal = cast<ConstantSDNode>(N->getOperand(0));
-  unsigned EltBits = 0;
-  uint64_t EltVal = ARM_AM::decodeVMOVModImm(ConstVal->getZExtValue(), EltBits);
-  return (EltBits == 8 && EltVal == 0xff);
-}]>;
-
 //===----------------------------------------------------------------------===//
 // NEON load / store instructions
 //===----------------------------------------------------------------------===//
@@ -5273,9 +5259,9 @@ def: NEONInstAlias<"vacle${p}.f16 $Vd, $Vm",
 // Vector Bitwise Operations.
 
 def vnotd : PatFrag<(ops node:$in),
-                    (xor node:$in, (bitconvert (v8i8 NEONimmAllOnesV)))>;
+                    (xor node:$in, ARMimmAllOnesD)>;
 def vnotq : PatFrag<(ops node:$in),
-                    (xor node:$in, (bitconvert (v16i8 NEONimmAllOnesV)))>;
+                    (xor node:$in, ARMimmAllOnesV)>;
 
 
 //   VAND     : Vector Bitwise AND
@@ -6054,9 +6040,9 @@ defm VQABS    : N2VInt_QHS<0b11, 0b11, 0b00, 0b01110, 0,
 // Vector Negate.
 
 def vnegd  : PatFrag<(ops node:$in),
-                     (sub (bitconvert (v2i32 NEONimmAllZerosV)), node:$in)>;
+                     (sub ARMimmAllZerosD, node:$in)>;
 def vnegq  : PatFrag<(ops node:$in),
-                     (sub (bitconvert (v4i32 NEONimmAllZerosV)), node:$in)>;
+                     (sub ARMimmAllZerosV, node:$in)>;
 
 class VNEGD<bits<2> size, string OpcodeStr, string Dt, ValueType Ty>
   : N2V<0b11, 0b11, size, 0b01, 0b00111, 0, 0, (outs DPR:$Vd), (ins DPR:$Vm),
@@ -6270,11 +6256,11 @@ defm : NEONImmReplicateInstAlias<i32, VMOVv2i32, VMOVv4i32,
 
 let AddedComplexity = 50, isAsCheapAsAMove = 1, isReMaterializable = 1 in {
   def VMOVD0 : ARMPseudoExpand<(outs DPR:$Vd), (ins), 4, IIC_VMOVImm,
-                               [(set DPR:$Vd, (v2i32 NEONimmAllZerosV))],
+                               [(set DPR:$Vd, (v2i32 ARMimmAllZerosD))],
                                (VMOVv2i32 DPR:$Vd, 0, (ops 14, zero_reg))>,
                Requires<[HasZCZ]>;
   def VMOVQ0 : ARMPseudoExpand<(outs QPR:$Vd), (ins), 4, IIC_VMOVImm,
-                               [(set QPR:$Vd, (v4i32 NEONimmAllZerosV))],
+                               [(set QPR:$Vd, (v4i32 ARMimmAllZerosV))],
                                (VMOVv4i32 QPR:$Vd, 0, (ops 14, zero_reg))>,
                Requires<[HasZCZ]>;
 }
@@ -9093,11 +9079,11 @@ multiclass BF16VDOTI<bit Q, RegisterClass RegTy, string opc, ValueType AccumTy,
     (!cast<Instruction>(NAME) RegTy:$Vd, RegTy:$Vn, RHS, VectorIndex32:$lane)>;
 }
 
-def BF16VDOTS_VDOTD : BF16VDOTS<0, DPR, "vdot", v2f32, v8i8>;
-def BF16VDOTS_VDOTQ : BF16VDOTS<1, QPR, "vdot", v4f32, v16i8>;
+def BF16VDOTS_VDOTD : BF16VDOTS<0, DPR, "vdot", v2f32, v4bf16>;
+def BF16VDOTS_VDOTQ : BF16VDOTS<1, QPR, "vdot", v4f32, v8bf16>;
 
-defm BF16VDOTI_VDOTD : BF16VDOTI<0, DPR, "vdot", v2f32, v8i8, (v2f32 DPR_VFP2:$Vm)>;
-defm BF16VDOTI_VDOTQ : BF16VDOTI<1, QPR, "vdot", v4f32, v16i8, (EXTRACT_SUBREG QPR:$Vm, dsub_0)>;
+defm BF16VDOTI_VDOTD : BF16VDOTI<0, DPR, "vdot", v2f32, v4bf16, (v2f32 DPR_VFP2:$Vm)>;
+defm BF16VDOTI_VDOTQ : BF16VDOTI<1, QPR, "vdot", v4f32, v8bf16, (EXTRACT_SUBREG QPR:$Vm, dsub_0)>;
 
 class BF16MM<bit Q, RegisterClass RegTy,
              string opc>
@@ -9105,8 +9091,8 @@ class BF16MM<bit Q, RegisterClass RegTy,
            (outs RegTy:$dst), (ins RegTy:$Vd, RegTy:$Vn, RegTy:$Vm),
            N3RegFrm, IIC_VDOTPROD, "", "",
                 [(set (v4f32 QPR:$dst), (int_arm_neon_bfmmla (v4f32 QPR:$Vd),
-                                                (v16i8 QPR:$Vn),
-                                                (v16i8 QPR:$Vm)))]> {
+                                                (v8bf16 QPR:$Vn),
+                                                (v8bf16 QPR:$Vm)))]> {
    let Constraints = "$dst = $Vd";
    let AsmString = !strconcat(opc, ".bf16", "\t$Vd, $Vn, $Vm");
    let DecoderNamespace = "VFPV8";
@@ -9120,8 +9106,8 @@ class VBF16MALQ<bit T, string suffix, SDPatternOperator OpNode>
            NoItinerary, "vfma" # suffix, "bf16", "$Vd, $Vn, $Vm", "",
                 [(set (v4f32 QPR:$dst),
                       (OpNode (v4f32 QPR:$Vd),
-                              (v16i8 QPR:$Vn),
-                              (v16i8 QPR:$Vm)))]> {
+                              (v8bf16 QPR:$Vn),
+                              (v8bf16 QPR:$Vm)))]> {
   let Constraints = "$dst = $Vd";
   let DecoderNamespace = "VFPV8";
 }
@@ -9142,9 +9128,9 @@ multiclass VBF16MALQI<bit T, string suffix, SDPatternOperator OpNode> {
 
   def : Pat<
     (v4f32 (OpNode (v4f32 QPR:$Vd),
-                   (v16i8 QPR:$Vn),
-                   (v16i8 (bitconvert (v8bf16 (ARMvduplane (v8bf16 QPR:$Vm),
-                                                           VectorIndex16:$lane)))))),
+                   (v8bf16 QPR:$Vn),
+                   (v8bf16 (ARMvduplane (v8bf16 QPR:$Vm),
+                            VectorIndex16:$lane)))),
     (!cast<Instruction>(NAME) QPR:$Vd,
                               QPR:$Vn,
                               (EXTRACT_SUBREG QPR:$Vm,
